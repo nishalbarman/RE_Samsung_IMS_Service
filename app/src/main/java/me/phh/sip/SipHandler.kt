@@ -733,6 +733,7 @@ a=${call.amrTrackDesc}
 a=ptime:20
 a=maxptime:240
 a=${call.dtmfTrackDesc}
+a=fmtp:${call.amrTrack} mode-set=7;octet-align=${if (call.amrOctetAligned) 1 else 0};max-red=0
 a=curr:qos local sendrecv
 a=curr:qos remote sendrecv
 a=des:qos mandatory local sendrecv
@@ -750,8 +751,9 @@ a=sendrecv
             rtpRemoteAddr = call.rtpRemoteAddr,
             rtpRemotePort = call.rtpRemotePort,
             rtpSocket = call.rtpSocket,
-            sdp = request.body,
+            sdp = mySdp,
             hasEarlyMedia = call.hasEarlyMedia,
+            amrOctetAligned = call.amrOctetAligned,
             imsMediaSession = call.imsMediaSession,
             remoteTarget = call.remoteTarget,
         )
@@ -812,6 +814,7 @@ a=sendrecv
         val rtpRemotePort: Int,
         val rtpSocket: DatagramSocket,
         val hasEarlyMedia: Boolean,
+        val amrOctetAligned: Boolean = false,
         val imsMediaSession: ImsMediaSession? = null,
         val remoteTarget: String? = null,
     )
@@ -821,6 +824,7 @@ a=sendrecv
     fun callEncodeThread() {
         val call = currentCall!!
         thread {
+            Rlog.w(TAG, "RTP encode thread starting octetAligned=${call.amrOctetAligned} remote=${call.rtpRemoteAddr}:${call.rtpRemotePort}")
             val AMR_FRAME_BYTES_WITH_HEADER = intArrayOf(13, 14, 16, 18, 20, 21, 27, 32)
             var sequenceNumber = 0
 
@@ -841,7 +845,12 @@ a=sendrecv
                     (timestamp shr 24), ((timestamp shr 16) and 0xff), ((timestamp shr 8) and 0xff), (timestamp and 0xff),
                     0x03, 0x00, 0xd2, 0x00, //SSRC
                 )
-                val amrNothing = listOf(0x77, 0xc0) // CMR = 12.2kbps, F=0, FT=15=No TX/No RX, Q=1
+                val amrNothing =
+                    if (call.amrOctetAligned) {
+                        listOf(0x70, 0x7c) // CMR = 12.2kbps, F=0, FT=15=No data, Q=1
+                    } else {
+                        listOf(0x77, 0xc0) // CMR = 12.2kbps, F=0, FT=15=No data, Q=1
+                    }
 
                 val buf = (rtpHeader + amrNothing).map { it.toUByte() }.toUByteArray().toByteArray()
 
@@ -862,7 +871,7 @@ a=sendrecv
             }
 
             audioRecord.startRecording()
-            Rlog.d(TAG, "AudioRecord started, minBufferSize=$minBufferSize recordingState=${audioRecord.recordingState}")
+            Rlog.w(TAG, "AudioRecord started, minBufferSize=$minBufferSize recordingState=${audioRecord.recordingState}")
 
             var firstPacket = true
             var readLogCounter = 0
@@ -930,26 +939,28 @@ a=sendrecv
                         val cmr = 7 // we want to announce we want the 12.2kbps profile
                         val f = 0
                         val q = 1
-                        val firstByte = (cmr shl 4) or (f shl 3) or (ft shr 1)
-                        val secondByte = ( (ft and 1) shl 7) or (q shl 6) or (encoderData[bufPos + 1].toUInt().toInt() shr 2)
-
-                        val nextBytes = (1 until (frameSize - 1)).map { i ->
-                            // Take 2 bits left, 6 bits right
-                            val left = (encoderData[bufPos + i].toUByte().toUInt().toInt() and 0x3) shl 6
-                            val right = (encoderData[bufPos + i + 1].toUByte().toUInt().toInt() shr 2) and 0x3f
-                            left or right
-                        }
-                        // Need to know the size in **bits** to know whether we include the lastByte or not
-                        // Anyway in mode = 7 = 12.2KHz, we don't.
-                        //val lastByte = (encoderData[bufPos + frameSize - 1].toUByte().toUInt().toInt() and 0x3) shl 6
-
-                        val buf = (rtpHeader + firstByte + secondByte + nextBytes /*+ lastByte*/).map { it.toUByte() }.toUByteArray().toByteArray()
+                        val buf =
+                            if (call.amrOctetAligned) {
+                                val cmrByte = cmr shl 4
+                                val tocByte = (f shl 7) or (ft shl 3) or (q shl 2)
+                                val frameBytes = encoderData.copyOfRange(bufPos + 1, bufPos + frameSize).map { it.toUByte().toUInt().toInt() }
+                                (rtpHeader + cmrByte + tocByte + frameBytes).map { it.toUByte() }.toUByteArray().toByteArray()
+                            } else {
+                                val firstByte = (cmr shl 4) or (f shl 3) or (ft shr 1)
+                                val secondByte = ((ft and 1) shl 7) or (q shl 6) or (encoderData[bufPos + 1].toUInt().toInt() shr 2)
+                                val nextBytes = (1 until (frameSize - 1)).map { i ->
+                                    val left = (encoderData[bufPos + i].toUByte().toUInt().toInt() and 0x3) shl 6
+                                    val right = (encoderData[bufPos + i + 1].toUByte().toUInt().toInt() shr 2) and 0x3f
+                                    left or right
+                                }
+                                (rtpHeader + firstByte + secondByte + nextBytes).map { it.toUByte() }.toUByteArray().toByteArray()
+                            }
 
                         val dgramPacket =
                             DatagramPacket(buf, buf.size, call.rtpRemoteAddr, call.rtpRemotePort)
                         call.rtpSocket.send(dgramPacket)
                         if (sentLogCounter++ % 100 == 0) {
-                            Rlog.d(TAG, "Sent RTP audio packet ft=$ft bytes=${buf.size} to ${call.rtpRemoteAddr}:${call.rtpRemotePort}")
+                            Rlog.w(TAG, "Sent RTP audio packet ft=$ft octetAligned=${call.amrOctetAligned} bytes=${buf.size} to ${call.rtpRemoteAddr}:${call.rtpRemotePort}")
                         }
 
                         sequenceNumber++
@@ -961,6 +972,7 @@ a=sendrecv
             audioRecord.release()
             encoder.stop()
             encoder.release()
+            Rlog.w(TAG, "RTP encode thread stopped")
         }
     }
 
@@ -1286,6 +1298,7 @@ a=sendrecv
                     rtpSocket = rtpSocket,
                     sdp = resp.body,
                     hasEarlyMedia = resp.headers["p-early-media"]?.isNotEmpty() == true,
+                    amrOctetAligned = false,
                     remoteTarget = remoteTarget,
                 )
 
@@ -1393,7 +1406,9 @@ a=sendrecv
     fun callDecodeThread() {
         // AMR-NB frame sizes in bytes (excluding 1-byte header) per FT
         val AMR_FRAME_BYTES = intArrayOf(12, 13, 15, 17, 19, 20, 26, 31)
+        val call = currentCall!!
         thread {
+            Rlog.w(TAG, "RTP decode thread starting octetAligned=${call.amrOctetAligned} local=${call.rtpSocket.localAddress}:${call.rtpSocket.localPort}")
             val minBufferSize = AudioTrack.getMinBufferSize(8000, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
             val audioTrack = AudioTrack(AudioManager.STREAM_VOICE_CALL, 8000, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT, minBufferSize, AudioTrack.MODE_STREAM)
             audioTrack.play()
@@ -1403,25 +1418,46 @@ a=sendrecv
             decoder.configure(mediaFormat, null, null, 0)
             decoder.start()
 
+            var packetCounter = 0
             while(true) {
                 if(callStopped.get()) break
                 val dgramBuf = ByteArray(2048)
                 val dgram = DatagramPacket(dgramBuf, dgramBuf.size)
-                currentCall!!.rtpSocket.receive(dgram)
+                call.rtpSocket.receive(dgram)
 
-                val ft = (dgramBuf[13].toUByte().toUInt() shr 7) or ((dgramBuf[12].toUByte().toUInt() and (7).toUInt()) shl 1)
-                Rlog.d(TAG, "Received RTP data length ${dgram.length} ft=$ft")
-                if (ft.toInt() < 0 || ft.toInt() > 7) continue
-
-                val frameBytes = AMR_FRAME_BYTES[ft.toInt()]
                 val baOs = ByteArrayOutputStream()
-                baOs.write(ft.toInt() shl 3)
+                val ft: Int
+                if (call.amrOctetAligned) {
+                    if (dgram.length < 15) continue
+                    val toc = dgramBuf[13].toUByte().toUInt().toInt()
+                    ft = (toc shr 3) and 0xf
+                    if (ft !in 0..7) continue
+                    val frameBytes = AMR_FRAME_BYTES[ft]
+                    if (dgram.length < 14 + frameBytes) {
+                        Rlog.w(TAG, "Short octet-aligned RTP length=${dgram.length} ft=$ft frameBytes=$frameBytes")
+                        continue
+                    }
+                    baOs.write((ft shl 3) or 0x04)
+                    baOs.write(dgramBuf, 14, frameBytes)
+                } else {
+                    ft = ((dgramBuf[13].toUByte().toUInt().toInt() shr 7) or ((dgramBuf[12].toUByte().toUInt().toInt() and 7) shl 1))
+                    if (ft !in 0..7) continue
+                    val frameBytes = AMR_FRAME_BYTES[ft]
+                    baOs.write((ft shl 3) or 0x04)
 
-                val dataEnd = 13 + frameBytes
-                for (i in 13 until dataEnd) {
-                    val left = (dgramBuf[i].toUByte().toUInt().toInt() and 0x3f) shl 2
-                    val right = (dgramBuf[i + 1].toUByte().toUInt().toInt() shr 6) and 0x3
-                    baOs.write(left or right)
+                    val dataEnd = 13 + frameBytes
+                    if (dgram.length <= dataEnd) {
+                        Rlog.w(TAG, "Short bandwidth-efficient RTP length=${dgram.length} ft=$ft frameBytes=$frameBytes")
+                        continue
+                    }
+                    for (i in 13 until dataEnd) {
+                        val left = (dgramBuf[i].toUByte().toUInt().toInt() and 0x3f) shl 2
+                        val right = (dgramBuf[i + 1].toUByte().toUInt().toInt() shr 6) and 0x3
+                        baOs.write(left or right)
+                    }
+                }
+                if (packetCounter++ % 100 == 0) {
+                    Rlog.w(TAG, "Received RTP data length=${dgram.length} ft=$ft octetAligned=${call.amrOctetAligned} from=${dgram.address}:${dgram.port}")
                 }
 
                 val inBufIndex = decoder.dequeueInputBuffer(-1)
@@ -1443,6 +1479,7 @@ a=sendrecv
             audioTrack.release()
             decoder.stop()
             decoder.release()
+            Rlog.w(TAG, "RTP decode thread stopped")
         }
     }
 
@@ -1574,10 +1611,11 @@ a=sendrecv
 
         val hasEarlyMedia = request.headers["p-early-media"]?.isNotEmpty() == true
 
-        // Look for an AMR/8000 mode
-        // TODO: Select which one? SFR has two, one with mode-set=7 one without it. This would require reading the fmtp lines
-        val (amrTrack, amrTrackDesc) = lookTrackMatching("AMR/8000", "octet-align=0", "octet-align=1")!!
+        // Look for an AMR/8000 mode. Prefer octet-aligned when offered because many carrier RTP relays use it.
+        val (amrTrack, amrTrackDesc) = lookTrackMatching("AMR/8000", "octet-align=1", "octet-align=0")!!
         val amrTrackRequirements = trackRequirements(amrTrack)
+        val amrOctetAligned = amrTrackRequirements?.contains("octet-align=1") == true
+        Rlog.w(TAG, "Selected AMR track=$amrTrack octetAligned=$amrOctetAligned fmtp=$amrTrackRequirements")
 
         // Look for a DTMF track, use the 8000Hz-based one to match AMR timestamps
         val (dtmfTrack, dtmfTrackDesc) = lookTrackMatching("telephone-event/8000")!!
@@ -1591,7 +1629,7 @@ a=sendrecv
             Thread.sleep(500)
             val rtpSocket = DatagramSocket(0, localAddr)
             network.bindSocket(rtpSocket)
-            rtpSocket.connect(rtpRemoteAddr, rtpRemotePort.toInt())
+            Rlog.w(TAG, "Opened incoming RTP socket local=${rtpSocket.localAddress}:${rtpSocket.localPort} remote=$rtpRemoteAddr:$rtpRemotePort octetAligned=$amrOctetAligned")
 
             val local =
                 if(socket.gLocalAddr() is Inet6Address)
@@ -1620,7 +1658,7 @@ a=$amrTrackDesc
 a=ptime:20
 a=maxptime:240
 a=$dtmfTrackDesc
-a=fmtp:$amrTrack mode-set=7;octet-align=0;max-red=0
+a=fmtp:$amrTrack mode-set=7;octet-align=${if (amrOctetAligned) 1 else 0};max-red=0
 a=fmtp:$dtmfTrack 0-15
 a=curr:qos local none
 a=curr:qos remote none
@@ -1662,6 +1700,7 @@ a=sendrecv
                 rtpSocket =  rtpSocket,
                 sdp = mySdp,
                 hasEarlyMedia = hasEarlyMedia,
+                amrOctetAligned = amrOctetAligned,
                 remoteTarget = remoteTarget,
             )
 
@@ -1705,7 +1744,8 @@ a=sendrecv
                                 rtpSocket = rtpSocket,
                                 sdp = mySdp,
                                 imsMediaSession = session,
-                                hasEarlyMedia = hasEarlyMedia
+                                hasEarlyMedia = hasEarlyMedia,
+                                amrOctetAligned = amrOctetAligned
                             )
                         }
 
