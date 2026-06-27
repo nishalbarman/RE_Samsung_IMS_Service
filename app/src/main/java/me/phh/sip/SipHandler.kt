@@ -22,7 +22,6 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import me.phh.ims.ImsConfigLoader
-import me.phh.ims.Rnnoise
 import java.io.*
 import java.net.*
 import java.util.concurrent.Executor
@@ -860,47 +859,55 @@ a=sendrecv
                 sequenceNumber++
             }
 
-            val rnnNoise = Rnnoise()
-
             // DANGER: Don't open the mic before the user acknowledged opening the call!
 
+            val pcmFrameSize = 160 * 2
             val minBufferSize = AudioRecord.getMinBufferSize(8000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
-            val audioRecord = AudioRecord(MediaRecorder.AudioSource.VOICE_COMMUNICATION, 8000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, minBufferSize)
+            val audioRecordBufferSize = maxOf(minBufferSize, pcmFrameSize * 4)
+            val audioRecord = AudioRecord(MediaRecorder.AudioSource.MIC, 8000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, audioRecordBufferSize)
             if (audioRecord.state != AudioRecord.STATE_INITIALIZED) {
                 Rlog.w(TAG, "AudioRecord is not initialized, state=${audioRecord.state}")
             }
 
             audioRecord.startRecording()
-            Rlog.w(TAG, "AudioRecord started, minBufferSize=$minBufferSize recordingState=${audioRecord.recordingState}")
+            Rlog.w(TAG, "AudioRecord started, source=MIC minBufferSize=$minBufferSize bufferSize=$audioRecordBufferSize recordingState=${audioRecord.recordingState}")
 
             var firstPacket = true
             var readLogCounter = 0
             var sentLogCounter = 0
 
-            val bufferSize = ((minBufferSize + (rnnNoise.getFrameSize() - 1 )) / rnnNoise.getFrameSize()).toInt() * rnnNoise.getFrameSize()
-            val buffer = ByteArray(bufferSize)
-            val bufferPostRnnoise = ByteArray(bufferSize)
+            val buffer = ByteArray(pcmFrameSize)
             while (true) {
                 if (callStopped.get()) break
-                val nRead = audioRecord.read(buffer,0, buffer.size)
-                if (nRead <= 0) {
-                    Rlog.w(TAG, "AudioRecord read failed: $nRead")
+                var totalRead = 0
+                while (totalRead < buffer.size && !callStopped.get()) {
+                    val nRead = audioRecord.read(buffer, totalRead, buffer.size - totalRead)
+                    if (nRead <= 0) {
+                        Rlog.w(TAG, "AudioRecord read failed: $nRead")
+                        break
+                    }
+                    totalRead += nRead
+                }
+                if (totalRead != buffer.size) {
                     continue
                 }
                 if (readLogCounter++ % 100 == 0) {
-                    val nonZero = buffer.take(nRead).any { it.toInt() != 0 }
-                    Rlog.d(TAG, "AudioRecord read $nRead bytes nonZero=$nonZero")
+                    var peak = 0
+                    for (i in 0 until buffer.size - 1 step 2) {
+                        val sample = ((buffer[i + 1].toInt() shl 8) or (buffer[i].toInt() and 0xff)).toShort().toInt()
+                        val absSample = if (sample == Int.MIN_VALUE) Int.MAX_VALUE else if (sample < 0) -sample else sample
+                        if (absSample > peak) peak = absSample
+                    }
+                    Rlog.w(TAG, "AudioRecord read ${buffer.size} bytes peak=$peak")
                 }
-                // Convert buffer from ByteArray to ShortArray
-                rnnNoise.processFrame(buffer, bufferPostRnnoise)
 
                 val inBufIdx = encoder.dequeueInputBuffer(-1)
                 val inBuf = encoder.getInputBuffer(inBufIdx)!!
                 inBuf.clear()
-                inBuf.put(bufferPostRnnoise, 0, nRead)
+                inBuf.put(buffer, 0, buffer.size)
 
                 // Fake timestamp but it is not appearing in the output stream anyway
-                encoder.queueInputBuffer(inBufIdx, 0, nRead, System.nanoTime() / 1000, 0)
+                encoder.queueInputBuffer(inBufIdx, 0, buffer.size, System.nanoTime() / 1000, 0)
 
                 val outBufInfo = MediaCodec.BufferInfo()
                 val outBufIdx = encoder.dequeueOutputBuffer(outBufInfo, 0)
