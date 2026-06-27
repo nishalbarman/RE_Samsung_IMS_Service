@@ -97,6 +97,13 @@ class PhhMmTelFeature(val slotId: Int) : android.telephony.ims.feature.PhhMmTelF
                 Rlog.d(TAG, "Terminating call with reason $reason")
                 sipHandler.terminateCall()
                 mState = State.TERMINATED
+                mListener.callSessionTerminated(
+                    ImsReasonInfo(
+                        ImsReasonInfo.CODE_USER_TERMINATED,
+                        0,
+                        "Local hangup"
+                    )
+                )
             }
         }
     }
@@ -250,6 +257,13 @@ class PhhMmTelFeature(val slotId: Int) : android.telephony.ims.feature.PhhMmTelF
                     Rlog.w(TAG, "Terminating call reason=$reason")
                     sipHandler.terminateCall()
                     mState = State.TERMINATED
+                    callListener?.callSessionTerminated(
+                        ImsReasonInfo(
+                            ImsReasonInfo.CODE_USER_TERMINATED,
+                            0,
+                            "Local hangup"
+                        )
+                    )
                     Rlog.w(TAG, "Terminating call done, mState=$mState")
                 }
 

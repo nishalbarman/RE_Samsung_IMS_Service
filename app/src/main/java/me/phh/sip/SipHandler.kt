@@ -752,7 +752,9 @@ a=sendrecv
             rtpSocket = call.rtpSocket,
             sdp = request.body,
             hasEarlyMedia = call.hasEarlyMedia,
-            )
+            imsMediaSession = call.imsMediaSession,
+            remoteTarget = call.remoteTarget,
+        )
 
         val reply =
             SipResponse(
@@ -1048,30 +1050,49 @@ a=sendrecv
         callStopped.set(true)
 
         val call = currentCall
+        thread(name = "SipTerminateCall") {
         if (call != null) {
             val dest = call.remoteTarget
             if (dest != null) {
+                val dialogHeaders =
+                    if (call.outgoing) {
+                        call.callHeaders.filter { (k, _) -> k in listOf("from", "to", "call-id") }
+                    } else {
+                        mapOf(
+                            "from" to call.callHeaders["to"]!!,
+                            "to" to call.callHeaders["from"]!!,
+                            "call-id" to call.callHeaders["call-id"]!!
+                        )
+                    }
                 val msg = SipRequest(
                     SipMethod.BYE,
                     dest,
                     commonHeaders +
-                    (call.callHeaders.filter { (k, _) -> k in listOf("from", "to", "call-id") }) +
+                    dialogHeaders +
                     """
                         CSeq: ${cseqCounter.getAndIncrement()} BYE
                     """.toSipHeadersMap()
                 )
-                Rlog.d(TAG, "Sending BYE $msg")
+                val callId = msg.headers["call-id"]!![0]
+                setResponseCallback(callId) { resp ->
+                    val cseq = resp.headers["cseq"]?.firstOrNull().orEmpty()
+                    if (!cseq.contains("BYE")) return@setResponseCallback false
+                    Log.w(TAG, "BYE response ${resp.statusCode} ${resp.statusString} callId=$callId")
+                    true
+                }
+                Log.w(TAG, "Sending BYE outgoing=${call.outgoing} dest=$dest callId=$callId from=${msg.headers["from"]} to=${msg.headers["to"]}")
                 try {
                     synchronized(socket.gWriter()) { socket.gWriter().write(msg.toByteArray()) }
                 } catch(t: Throwable) {
-                    Log.d(TAG, "Failed sending BYE", t)
+                    Log.w(TAG, "Failed sending BYE", t)
                 }
             } else {
-                Rlog.d(TAG, "No remote target for BYE, skipping")
+                Log.w(TAG, "No remote target for BYE, skipping outgoing=${call.outgoing} headers=${call.callHeaders}")
             }
+        } else {
+            Log.w(TAG, "No current call for BYE, skipping")
         }
-
-        onCancelledCall?.invoke(Object(), "", emptyMap())
+        }
     }
 
     /*
@@ -1426,8 +1447,13 @@ a=sendrecv
     }
 
     fun extractDestinationFromContact(contact: String): String {
-        val r = Regex(".*<(sip:[^>]*)>.*")
-        return r.find(contact)!!.groups[1]!!.value
+        return Regex("<([^>]*)>").find(contact)?.groups?.get(1)?.value
+            ?: Regex("(sip:[^;>, ]+)").find(contact)?.groups?.get(1)?.value
+            ?: contact.substringBefore(";").trim()
+    }
+
+    private fun withSipTag(header: String, tag: String): String {
+        return if (header.contains(";tag=", ignoreCase = true)) header else "$header;tag=$tag"
     }
 
     val callStopped = AtomicBoolean(false)
@@ -1604,6 +1630,13 @@ a=conf:qos remote sendrecv
 a=sendrecv
                        """.trim().toByteArray()
 
+            val localDialogTag = randomBytes(6).toHex()
+            val inviteDialogHeaders =
+                request.headers
+                    .filter { (k, _) -> k in listOf("cseq", "via", "from", "to", "call-id") }
+                    .mapValues { (k, v) ->
+                        if (k == "to") v.map { withSipTag(it, localDialogTag) } else v
+                    }
             val myHeaders = commonHeaders + //Require: precondition
                 """
                         Contact: $contactTel
@@ -1613,7 +1646,7 @@ a=sendrecv
                         RSeq: $mySeqCounter
                         P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=20810b8c49752501
                         """.toSipHeadersMap() +
-                            request.headers.filter { (k, _) -> k in listOf("cseq", "via", "from", "to", "call-id") } -
+                            inviteDialogHeaders -
                 "route" - "security-verify"
 
             val remoteTarget = request.headers["contact"]?.getOrNull(0)?.let { extractDestinationFromContact(it) }
