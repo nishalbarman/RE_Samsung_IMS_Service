@@ -47,7 +47,7 @@ class SipHandler(val ctxt: Context) {
     val imsMediaManager = ImsMediaManager(ctxt, myExecutor, object:
         ImsMediaManager.OnConnectedCallback {
         override fun onConnected() {
-            Rlog.d(TAG, "ImsMediaManager connected")
+            Rlog.w(TAG, "ImsMediaManager connected")
         }
 
         override fun onDisconnected() {
@@ -1475,7 +1475,9 @@ a=sendrecv
 
         val callerIdentity = extractCallerIdentity(request)
         val m = callerIdentity["from"] ?: "unknown"
-        Rlog.d(TAG, "Incoming call from $m uri=${callerIdentity["caller-uri"]} name=${callerIdentity["caller-name"]}")
+        Rlog.w(TAG, "Incoming call from $m uri=${callerIdentity["caller-uri"]} name=${callerIdentity["caller-name"]}")
+        Rlog.w(TAG, "Raw headers: p-ai=${callerIdentity["raw-p-asserted-identity"]} rpid=${callerIdentity["raw-remote-party-id"]} from=${callerIdentity["raw-from"]}")
+        Rlog.w(TAG, "All INVITE headers: ${request.headers.entries.joinToString(", ") { "${it.key}=${it.value}" }}")
         onIncomingCall?.invoke(
             Object(),
             m,
@@ -1793,7 +1795,6 @@ P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=4500620f331a5e06
             if (i.host == null) null else i
         } catch (t: Throwable) { null }
         Rlog.d(TAG, "Got smscIdentity $smscIdentity")
-        // make ref up?
         val smsc =
             if (smsSmsc != null && decodableSmsc) smsSmsc
             else if (forceSmsc != null) forceSmsc
@@ -1841,11 +1842,13 @@ P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=4500620f331a5e06
                     From: <$mySip>
                     To: <$dest>
                     P-Preferred-Identity: <$mySip>
+                    P-Asserted-Identity: <$mySip>
                     Expires: 600000
                     Content-Type: application/vnd.3gpp.sms
                     Supported: sec-agree, path
                     Require: sec-agree
                     Proxy-Require: sec-agree
+                    Allow: MESSAGE
                     Accept-Contact: *;+g.3gpp.smsip;require;explicit
                     Request-Disposition: no-fork
                     """.toSipHeadersMap(),

@@ -13,3 +13,7 @@
 .externalNativeBuild
 .cxx
 local.properties
+
+/keys
+platform.key.pem
+platform.p12

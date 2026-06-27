@@ -4,13 +4,13 @@ plugins {
 }
 
 android {
-    compileSdk 33
+    compileSdk 34
     ndkVersion "25.1.8937393"
 
     defaultConfig {
         applicationId "me.phh.ims"
         minSdk 32
-        targetSdk 33
+        targetSdk 34
         versionCode 34
         versionName "1.0.1"
 

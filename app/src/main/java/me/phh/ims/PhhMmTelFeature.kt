@@ -32,6 +32,7 @@ class PhhMmTelFeature(val slotId: Int) : android.telephony.ims.feature.PhhMmTelF
 
     val imsSms = PhhImsSms(slotId)
     lateinit var sipHandler: SipHandler
+    var outgoingCallListener: ImsCallSessionListener? = null
 
     override fun createCallProfile(callSessionType: Int, callType: Int): ImsCallProfile {
         Rlog.d(TAG, "$slotId createCallProfile $callSessionType $callType")
@@ -143,18 +144,33 @@ class PhhMmTelFeature(val slotId: Int) : android.telephony.ims.feature.PhhMmTelF
         sipHandler.onSmsStatusReportReceived = imsSms::onSmsStatusReportReceived
 
         var incomingCallListener: ImsCallSessionListener? = null
-        var outgoingCallListener: ImsCallSessionListener? = null
         sipHandler.onIncomingCall = { handle: Object, from: String, extras: Map<String, String> -> 
             val callId = extras["call-id"] ?: randomBytes(12).toHex()
-            val callerNumber = from.ifEmpty { extras["caller-uri"] ?: "unknown" }
             val callerName = extras["caller-name"].orEmpty()
-            val callerUri = extras["caller-uri"] ?: "tel:$callerNumber"
-            val telecomAddress = if (callerNumber.any { it.isDigit() }) {
-                Uri.fromParts("tel", callerNumber, null)
-            } else {
-                Uri.parse(callerUri)
+            val callerUri = extras["caller-uri"] ?: "tel:unknown"
+            val digitsOnly = from.filter { it.isDigit() || it == '+' }
+            val callerNumber = when {
+                digitsOnly.isNotEmpty() -> digitsOnly
+                callerName.isNotEmpty() -> callerName
+                extras["raw-p-asserted-identity"] != null -> {
+                    extras["raw-p-asserted-identity"]!!.filter { it.isDigit() || it == '+' }
+                        .takeIf { it.isNotEmpty() } ?: "unknown"
+                }
+                extras["raw-from"] != null -> {
+                    extras["raw-from"]!!.filter { it.isDigit() || it == '+' }
+                        .takeIf { it.isNotEmpty() } ?: "unknown"
+                }
+                else -> "unknown"
             }
-            Rlog.d(TAG, "Incoming call notify from $callerNumber name=$callerName uri=$callerUri callId $callId")
+            val presentation = if (callerNumber != "unknown") {
+                ImsCallProfile.OIR_PRESENTATION_NOT_RESTRICTED
+            } else {
+                ImsCallProfile.OIR_PRESENTATION_UNKNOWN
+            }
+            val callerDisplay = callerName.ifEmpty { callerNumber }
+            val telecomAddress = Uri.fromParts("tel", callerNumber, null)
+            Rlog.w(TAG, "Incoming call notify from=$callerNumber callerName=$callerName callerUri=$callerUri callId=$callId from=$from")
+
             val callProfile = ImsCallProfile(ImsCallProfile.SERVICE_TYPE_NORMAL, ImsCallProfile.CALL_TYPE_VOICE,
                 Bundle(),
                 ImsStreamMediaProfile(
@@ -164,16 +180,18 @@ class PhhMmTelFeature(val slotId: Int) : android.telephony.ims.feature.PhhMmTelF
                     ImsStreamMediaProfile.DIRECTION_INACTIVE,
                     ImsStreamMediaProfile.RTT_MODE_DISABLED,
                 ))
-
             callProfile.setCallExtra(ImsCallProfile.EXTRA_OI, callerNumber)
-            callProfile.setCallExtra("cna", callerName.ifEmpty { callerNumber })
-            callProfile.setCallExtra("oir", "2")
-            callProfile.setCallExtra("cnap", "2")
-            callProfile.setCallExtra(ImsCallProfile.EXTRA_DISPLAY_TEXT, callerName.ifEmpty { callerNumber })
+            callProfile.setCallExtra(ImsCallProfile.EXTRA_CNA, callerDisplay)
+            callProfile.setCallExtra(ImsCallProfile.EXTRA_DISPLAY_TEXT, callerDisplay)
+            callProfile.setCallExtraInt(ImsCallProfile.EXTRA_OIR, presentation)
+            callProfile.setCallExtraInt(ImsCallProfile.EXTRA_CNAP, presentation)
+
+            Rlog.w(TAG, "Incoming call extras: ${extras.entries.joinToString(", ") { "${it.key}=${it.value}" }}")
             val incomingSession = object: ImsCallSessionImplBase() {
                 var callListener: ImsCallSessionListener? = null
                 var mState = State.INITIATED
                 override fun getCallProfile(): ImsCallProfile {
+                    Rlog.w(TAG, "getCallProfile called EXTRA_OI=${callProfile.getCallExtra(ImsCallProfile.EXTRA_OI)} callId=$callId")
                     return callProfile
                 }
                 override fun setListener(listener: ImsCallSessionListener) {
@@ -222,48 +240,46 @@ class PhhMmTelFeature(val slotId: Int) : android.telephony.ims.feature.PhhMmTelF
                 }
 
                 override fun reject(reason: Int) {
+                    Rlog.w(TAG, "Rejecting call $reason")
                     sipHandler.rejectCall()
                     mState = State.TERMINATED
-                    Rlog.d(TAG, "Rejecting call $reason")
+                    Rlog.w(TAG, "Rejecting call done")
                 }
 
                 override fun terminate(reason: Int) {
+                    Rlog.w(TAG, "Terminating call reason=$reason")
                     sipHandler.terminateCall()
                     mState = State.TERMINATED
-                    Rlog.d(TAG, "Terminating call")
+                    Rlog.w(TAG, "Terminating call done, mState=$mState")
                 }
 
             }
             val incomingExtras = Bundle().apply {
                 putString("call-id", callId)
                 putString(ImsCallProfile.EXTRA_OI, callerNumber)
-                putString("cna", callerName.ifEmpty { callerNumber })
-                putString("oir", "2")
-                putString("cnap", "2")
-                putString(ImsCallProfile.EXTRA_DISPLAY_TEXT, callerName.ifEmpty { callerNumber })
+                putString(ImsCallProfile.EXTRA_CNA, callerDisplay)
+                putInt(ImsCallProfile.EXTRA_OIR, presentation)
+                putInt(ImsCallProfile.EXTRA_CNAP, presentation)
+                putString(ImsCallProfile.EXTRA_DISPLAY_TEXT, callerDisplay)
                 putParcelable(TelecomManager.EXTRA_INCOMING_CALL_ADDRESS, telecomAddress)
-                putString("android.telecom.extra.CALLER_DISPLAY_NAME", callerName.ifEmpty { callerNumber })
-                putString("android.telephony.ims.extra.CALL_ID", callId)
-                putString("android.telephony.ims.extra.CALLER_NUMBER", callerNumber)
-                putString("android.telephony.ims.extra.CALLER_NAME", callerName)
-                putString("android.telephony.ims.extra.CALLER_URI", callerUri)
+                putString("android.telecom.extra.CALLER_DISPLAY_NAME", callerDisplay)
                 putString("raw-from", extras["raw-from"])
                 putString("raw-p-asserted-identity", extras["raw-p-asserted-identity"])
                 putString("raw-remote-party-id", extras["raw-remote-party-id"])
             }
             notifyIncomingCall(incomingSession, incomingExtras)
-            Rlog.d(TAG, "notifyIncomingCall returned for $callId")
+            Rlog.w(TAG, "notifyIncomingCall returned for $callId presentation=$presentation oi=${callProfile.getCallExtra(ImsCallProfile.EXTRA_OI)} cna=${callProfile.getCallExtra(ImsCallProfile.EXTRA_CNA)}")
         }
         sipHandler.onCancelledCall = { param: Object, s: String, map: Map<String, String> ->
-            Rlog.d(TAG, "Cancelling call")
+            Rlog.w(TAG, "Cancelling call listener=$incomingCallListener outgoing=$outgoingCallListener")
             val l = incomingCallListener ?: outgoingCallListener
             val statusCode = map["statusCode"]?.toInt() ?: -1
             if (statusCode >= 400) {
                 val statusMessage = map["statusString"] ?: "Kikoo"
-                Rlog.d(TAG, "Remote/network terminated call with $statusCode $statusMessage")
+                Rlog.w(TAG, "Remote/network terminated call with $statusCode $statusMessage")
                 l?.callSessionTerminated(ImsReasonInfo(ImsReasonInfo.CODE_NETWORK_REJECT, 0, statusMessage))
             } else {
-                Rlog.d(TAG, "Remote terminated call")
+                Rlog.w(TAG, "Remote terminated call")
                 l?.callSessionTerminated(
                     ImsReasonInfo(
                         ImsReasonInfo.CODE_USER_TERMINATED_BY_REMOTE,
