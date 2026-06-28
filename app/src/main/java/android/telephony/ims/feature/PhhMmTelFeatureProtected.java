@@ -28,6 +28,13 @@ public class PhhMmTelFeatureProtected extends MmTelFeature {
 			MmTelCapabilities.CAPABILITY_TYPE_SMS;
 	}
 
+	public void publishCapabilities() {
+		Rlog.d(TAG, slotId + " publishCapabilities: " + this.capabilities);
+		MmTelFeature.MmTelCapabilities capabilities = new MmTelFeature.MmTelCapabilities();
+		capabilities.addCapabilities(this.capabilities);
+		notifyCapabilitiesStatusChanged(capabilities);
+	}
+
 	public void changeEnabledCapabilities(CapabilityChangeRequest capabilityChangeRequest,
 			ImsFeature.CapabilityCallbackProxy capabilityCallbackProxy) {
 		Rlog.d(TAG, slotId + " changeEnabledCapabilities");
@@ -53,8 +60,6 @@ public class PhhMmTelFeatureProtected extends MmTelFeature {
 		});
 		Rlog.d(TAG, "Final capabilities: " + this.capabilities);
 
-		MmTelFeature.MmTelCapabilities capabilities = new MmTelFeature.MmTelCapabilities();
-		capabilities.addCapabilities(this.capabilities);
-		notifyCapabilitiesStatusChanged(capabilities);
+		publishCapabilities();
 	}
 }

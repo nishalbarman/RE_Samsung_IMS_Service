@@ -136,6 +136,7 @@ class PhhMmTelFeature(val slotId: Int) : android.telephony.ims.feature.PhhMmTelF
 
     override fun onFeatureReady() {
         Rlog.d(TAG, "$slotId onFeatureReady")
+        publishCapabilities()
         if(this::sipHandler.isInitialized) return
 
         // call onRegistering first then
@@ -145,6 +146,7 @@ class PhhMmTelFeature(val slotId: Int) : android.telephony.ims.feature.PhhMmTelF
         sipHandler.imsFailureCallback = { imsService.getRegistration(slotId).onDeregistered(null) }
         sipHandler.imsReadyCallback = {
             imsService.getRegistration(slotId).onRegistered(REGISTRATION_TECH_LTE)
+            publishCapabilities()
         }
         imsSms.sipHandler = sipHandler
         sipHandler.onSmsReceived = imsSms::onSmsReceived
