@@ -822,7 +822,7 @@ a=sendrecv
     @SuppressLint("MissingPermission")
     fun callEncodeThread() {
         val call = currentCall!!
-        thread {
+        thread(name = "SipRtpEncode") {
             Rlog.w(TAG, "RTP encode thread starting octetAligned=${call.amrOctetAligned} remote=${call.rtpRemoteAddr}:${call.rtpRemotePort}")
             val AMR_FRAME_BYTES_WITH_HEADER = intArrayOf(13, 14, 16, 18, 20, 21, 27, 32)
             var sequenceNumber = 0
@@ -833,7 +833,7 @@ a=sendrecv
             encoder.configure(mediaFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             encoder.start()
 
-            while(!callStarted.get()) {
+            while(!callStarted.get() && !callStopped.get()) {
                 val timestamp = sequenceNumber * 160
                 Thread.sleep(20)
                 val rtpHeader = listOf(
@@ -858,19 +858,29 @@ a=sendrecv
                 call.rtpSocket.send(dgramPacket)
                 sequenceNumber++
             }
+            if (callStopped.get()) {
+                encoder.stop()
+                encoder.release()
+                Rlog.w(TAG, "RTP encode thread stopped before call started")
+                return@thread
+            }
 
             // DANGER: Don't open the mic before the user acknowledged opening the call!
 
             val pcmFrameSize = 160 * 2
+            val audioManager = ctxt.getSystemService(AudioManager::class.java)
+            audioManager?.isMicrophoneMute = false
+            Rlog.w(TAG, "Requested microphone unmute before AudioRecord, muted=${audioManager?.isMicrophoneMute}")
             val minBufferSize = AudioRecord.getMinBufferSize(8000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
             val audioRecordBufferSize = maxOf(minBufferSize, pcmFrameSize * 4)
-            val audioRecord = AudioRecord(MediaRecorder.AudioSource.MIC, 8000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, audioRecordBufferSize)
+            val audioSource = MediaRecorder.AudioSource.VOICE_RECOGNITION
+            val audioRecord = AudioRecord(audioSource, 8000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, audioRecordBufferSize)
             if (audioRecord.state != AudioRecord.STATE_INITIALIZED) {
-                Rlog.w(TAG, "AudioRecord is not initialized, state=${audioRecord.state}")
+                Rlog.w(TAG, "AudioRecord is not initialized, source=VOICE_RECOGNITION state=${audioRecord.state}")
             }
 
             audioRecord.startRecording()
-            Rlog.w(TAG, "AudioRecord started, source=MIC minBufferSize=$minBufferSize bufferSize=$audioRecordBufferSize recordingState=${audioRecord.recordingState}")
+            Rlog.w(TAG, "AudioRecord started, source=VOICE_RECOGNITION minBufferSize=$minBufferSize bufferSize=$audioRecordBufferSize recordingState=${audioRecord.recordingState}")
 
             var firstPacket = true
             var readLogCounter = 0
@@ -891,14 +901,25 @@ a=sendrecv
                 if (totalRead != buffer.size) {
                     continue
                 }
-                if (readLogCounter++ % 100 == 0) {
+                val shouldLogRead = readLogCounter < 10 || readLogCounter % 100 == 0
+                readLogCounter++
+                if (shouldLogRead) {
                     var peak = 0
                     for (i in 0 until buffer.size - 1 step 2) {
                         val sample = ((buffer[i + 1].toInt() shl 8) or (buffer[i].toInt() and 0xff)).toShort().toInt()
                         val absSample = if (sample == Int.MIN_VALUE) Int.MAX_VALUE else if (sample < 0) -sample else sample
                         if (absSample > peak) peak = absSample
                     }
-                    Rlog.w(TAG, "AudioRecord read ${buffer.size} bytes peak=$peak")
+                    Rlog.w(TAG, "AudioRecord read ${buffer.size} bytes peak=$peak source=VOICE_RECOGNITION")
+                }
+
+                // Apply uplink gain to PCM before encoding
+                val uplinkGain = 27.0f
+                for (i in 0 until buffer.size - 1 step 2) {
+                    val sample = ((buffer[i + 1].toInt() shl 8) or (buffer[i].toInt() and 0xff)).toShort().toInt()
+                    val boosted = (sample * uplinkGain).toInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
+                    buffer[i] = (boosted and 0xff).toByte()
+                    buffer[i + 1] = ((boosted shr 8) and 0xff).toByte()
                 }
 
                 val inBufIdx = encoder.dequeueInputBuffer(-1)
@@ -984,6 +1005,18 @@ a=sendrecv
     }
 
     var currentCall: Call? = null
+
+    private val mediaThreadsStarted = AtomicBoolean(false)
+    private fun startMediaThreads(reason: String) {
+        if (mediaThreadsStarted.compareAndSet(false, true)) {
+            Rlog.w(TAG, "Starting RTP media threads: $reason")
+            callDecodeThread()
+            callEncodeThread()
+        } else {
+            Rlog.w(TAG, "RTP media threads already started, ignoring: $reason")
+        }
+    }
+
     fun acceptCall() {
         thread {
 
@@ -1141,6 +1174,9 @@ a=sendrecv
     var respInFlight: SipResponse? = null
     fun call(phoneNumber: String) {
         thread {
+            callStopped.set(false)
+            callStarted.set(false)
+            mediaThreadsStarted.set(false)
 
             val rtpSocket = DatagramSocket(0, localAddr)
             val fakeRtcpSocket = DatagramSocket(0, localAddr) //useless but annoying ImsMediaManager
@@ -1284,6 +1320,7 @@ a=sendrecv
                 if (!isSdp) return@setResponseCallback false
 
                 val respSdp = resp.body.toString(Charsets.UTF_8).split("[\r\n]+".toRegex()).toList()
+                val respAttributes = respSdp.filter { it.startsWith("a=") }.map { it.substring(2) }
 
                 fun sdpElement(command: String): String? {
                     val v = respSdp.firstOrNull { it.startsWith("$command=")} ?: return null
@@ -1292,6 +1329,9 @@ a=sendrecv
                 val rtpRemotePort = sdpElement("m")!!.split(" ")[1]
                 val rtpRemoteAddr = InetAddress.getByName(sdpElement("c")!!.split(" ")[2])
                 val remoteTarget = resp.headers["contact"]?.getOrNull(0)?.let { extractDestinationFromContact(it) }
+                val responseAmrFmtp = respAttributes.firstOrNull { it.startsWith("fmtp:$amrTrack") }
+                val responseAmrOctetAligned = responseAmrFmtp?.contains("octet-align=1") == true
+                Rlog.w(TAG, "Outgoing SDP media remote=$rtpRemoteAddr:$rtpRemotePort amrOctetAligned=$responseAmrOctetAligned fmtp=$responseAmrFmtp status=${resp.statusCode} cseq=$cseq")
                 currentCall = Call(
                     outgoing = true,
                     amrTrack = amrTrack,
@@ -1305,7 +1345,7 @@ a=sendrecv
                     rtpSocket = rtpSocket,
                     sdp = resp.body,
                     hasEarlyMedia = resp.headers["p-early-media"]?.isNotEmpty() == true,
-                    amrOctetAligned = false,
+                    amrOctetAligned = responseAmrOctetAligned,
                     remoteTarget = remoteTarget,
                 )
 
@@ -1329,8 +1369,7 @@ a=sendrecv
 
                     if (localNone) {
                         // "Allocating our local resource" and update the call
-                        callDecodeThread()
-                        callEncodeThread()
+                        startMediaThreads("outgoing precondition 183 local resource")
 
                         val newSdp = respSdp.map { line ->
                             if (line.startsWith("a=curr:qos local")) {
@@ -1357,8 +1396,11 @@ a=sendrecv
                 }
 
                 if(!isPrecondition && resp.statusCode == 183) {
-                    callDecodeThread()
-                    callEncodeThread()
+                    startMediaThreads("outgoing 183 SDP without precondition")
+                }
+
+                if(cseq.contains("INVITE") && (resp.statusCode == 200 || resp.statusCode == 202)) {
+                    startMediaThreads("outgoing final INVITE SDP")
                 }
 
                    /* } else {
@@ -1416,9 +1458,17 @@ a=sendrecv
         val call = currentCall!!
         thread {
             Rlog.w(TAG, "RTP decode thread starting octetAligned=${call.amrOctetAligned} local=${call.rtpSocket.localAddress}:${call.rtpSocket.localPort}")
+            val audioManager = ctxt.getSystemService(AudioManager::class.java)
+            val maxVoiceVolume = audioManager?.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL) ?: -1
+            if (audioManager != null && maxVoiceVolume > 0) {
+                audioManager.setStreamVolume(AudioManager.STREAM_VOICE_CALL, maxVoiceVolume, 0)
+            }
             val minBufferSize = AudioTrack.getMinBufferSize(8000, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
             val audioTrack = AudioTrack(AudioManager.STREAM_VOICE_CALL, 8000, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT, minBufferSize, AudioTrack.MODE_STREAM)
+            audioTrack.setVolume(AudioTrack.getMaxVolume())
             audioTrack.play()
+            val playbackGain = 1.0f
+            Rlog.w(TAG, "AudioTrack started minBufferSize=$minBufferSize playbackGain=$playbackGain voiceVolume=${audioManager?.getStreamVolume(AudioManager.STREAM_VOICE_CALL)}/$maxVoiceVolume")
 
             val decoder = MediaCodec.createDecoderByType("audio/3gpp")
             val mediaFormat = MediaFormat.createAudioFormat("audio/3gpp", 8000, 1)
@@ -1452,16 +1502,20 @@ a=sendrecv
                     val frameBytes = AMR_FRAME_BYTES[ft]
                     baOs.write((ft shl 3) or 0x04)
 
-                    val dataEnd = 13 + frameBytes
-                    if (dgram.length <= dataEnd) {
-                        Rlog.w(TAG, "Short bandwidth-efficient RTP length=${dgram.length} ft=$ft frameBytes=$frameBytes")
+                    val expectedLen = 13 + frameBytes
+                    if (dgram.length < expectedLen) {
+                        Rlog.w(TAG, "Short bandwidth-efficient RTP length=${dgram.length} ft=$ft frameBytes=$frameBytes expected=$expectedLen")
                         continue
                     }
-                    for (i in 13 until dataEnd) {
+                    // Reconstruct frame bytes from packed pairs (byte[i] 6 MSB + byte[i+1] 2 LSB)
+                    // The last frame byte only has 6 MSB transmitted; LSB 2 bits are padding (zeros)
+                    for (i in 13 until expectedLen - 1) {
                         val left = (dgramBuf[i].toUByte().toUInt().toInt() and 0x3f) shl 2
                         val right = (dgramBuf[i + 1].toUByte().toUInt().toInt() shr 6) and 0x3
                         baOs.write(left or right)
                     }
+                    val lastInput = dgramBuf[12 + frameBytes].toUByte().toUInt().toInt()
+                    baOs.write((lastInput and 0x3f) shl 2)
                 }
                 if (packetCounter++ % 100 == 0) {
                     Rlog.w(TAG, "Received RTP data length=${dgram.length} ft=$ft octetAligned=${call.amrOctetAligned} from=${dgram.address}:${dgram.port}")
@@ -1478,7 +1532,17 @@ a=sendrecv
                 val outBufIndex = decoder.dequeueOutputBuffer(outBufInfo, 0)
                 if (outBufIndex >= 0) {
                     val outBuf = decoder.getOutputBuffer(outBufIndex)!!
-                    audioTrack.write(outBuf, outBufInfo.size, AudioTrack.WRITE_BLOCKING)
+                    val pcm = ByteArray(outBufInfo.size)
+                    outBuf.position(outBufInfo.offset)
+                    outBuf.limit(outBufInfo.offset + outBufInfo.size)
+                    outBuf.get(pcm)
+                    for (i in 0 until pcm.size - 1 step 2) {
+                        val sample = ((pcm[i + 1].toInt() shl 8) or (pcm[i].toInt() and 0xff)).toShort().toInt()
+                        val boosted = (sample * playbackGain).toInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
+                        pcm[i] = (boosted and 0xff).toByte()
+                        pcm[i + 1] = ((boosted shr 8) and 0xff).toByte()
+                    }
+                    audioTrack.write(pcm, 0, pcm.size)
                     decoder.releaseOutputBuffer(outBufIndex, false)
                 }
             }
@@ -1542,6 +1606,7 @@ a=sendrecv
         if (contentType != "application/sdp") return 404
         callStopped.set(false)
         callStarted.set(false)
+        mediaThreadsStarted.set(false)
 
         val callerIdentity = extractCallerIdentity(request)
         val m = callerIdentity["from"] ?: "unknown"
@@ -1765,8 +1830,7 @@ a=sendrecv
                     }
                 )
             } else {
-                callDecodeThread()
-                callEncodeThread()
+                startMediaThreads("incoming INVITE SDP")
             }
 
 
